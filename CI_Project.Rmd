@@ -1,0 +1,862 @@
+---
+title: "CI_Project"
+author: "Pradeep"
+date: "2025-12-01"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(grf)
+library(tidycensus)
+library(janitor)
+
+fcc_path <- "county_tiers_201406_202406/county_tiers_201406_202406.csv"
+
+fcc_raw <- read_csv(fcc_path)
+
+glimpse(fcc_raw)
+names(fcc_raw)
+head(fcc_raw, 10)
+
+
+fcc_clean <- fcc_raw %>%
+  clean_names() %>%
+  mutate(
+    fips = str_pad(as.character(fips), width = 5, pad = "0")
+  )
+
+fcc_model <- fcc_clean %>%
+  mutate(
+    treated = if_else(tier_3 >= 80, 1, 0)
+  ) %>%
+  select(fips, year, housing_units, tier_1, tier_2, tier_3, tier_4, treated)
+
+
+#TIER CODE DEFINITIONS (FROM FCC README)
+
+
+cat("Tier_3 = Broadband connections at 25+ Mbps (FCC standard)\n\n")
+
+cat("Tier Value Coding (connections per 1,000 housing units):\n")
+cat("  0 = 0 connections\n")
+cat("  1 = 0 < X <= 200\n")
+cat("  2 = 200 < X <= 400\n")
+cat("  3 = 400 < X <= 600\n")
+cat("  4 = 600 < X <= 800\n")
+cat("  5 = 800+ connections\n\n")
+
+cat("Tier_3 distribution across all years:\n")
+print(table(fcc_raw$Tier_3, useNA = "ifany"))
+cat("\n")
+
+#CREATING TREATMENT VARIABLE
+
+fcc_raw <- fcc_raw %>%
+  mutate(FIPS = sprintf("%05d", as.numeric(FIPS)))
+
+treatment_2014 <- fcc_raw %>%
+  filter(Year == 2014, Month == 12) %>%
+  select(
+    fips = FIPS,
+    state = State,
+    county_name = County_Name,
+    housing_units_2014 = Housing_Units,
+    broadband_25mbps_tier_2014 = Tier_3  # 25+ Mbps tier code
+  )
+
+# Extracting June 2024 as outcome period
+treatment_2024 <- fcc_raw %>%
+  filter(Year == 2024, Month == 6) %>%
+  select(
+    fips = FIPS,
+    housing_units_2024 = Housing_Units,
+    broadband_25mbps_tier_2024 = Tier_3  # 25+ Mbps tier code
+  )
+
+treatment_df <- treatment_2014 %>%
+  left_join(treatment_2024, by = "fips")
+
+cat("Baseline (Dec 2014):", nrow(treatment_2014), "counties\n")
+cat("Outcome (Jun 2024):", nrow(treatment_2024), "counties\n")
+cat("Merged:", nrow(treatment_df), "counties\n")
+cat("Complete cases:", sum(!is.na(treatment_df$broadband_25mbps_tier_2014) & 
+                           !is.na(treatment_df$broadband_25mbps_tier_2024)), "\n\n")
+
+treatment_df <- treatment_df %>%
+  mutate(
+    broadband_treatment_2014 = broadband_25mbps_tier_2014,
+
+    high_broadband_2014 = ifelse(broadband_25mbps_tier_2014 >= 4, 1, 0),
+
+    moderate_broadband_2014 = ifelse(broadband_25mbps_tier_2014 >= 3, 1, 0),
+
+    broadband_change = broadband_25mbps_tier_2024 - broadband_25mbps_tier_2014,
+    
+    broadband_improved = ifelse(broadband_25mbps_tier_2024 > broadband_25mbps_tier_2014, 1, 0)
+  )
+
+cat("Broadband Access (25+ Mbps) in Dec 2014:\n")
+print(table(treatment_df$broadband_25mbps_tier_2014, useNA = "ifany"))
+cat("\n")
+
+cat("Broadband Access (25+ Mbps) in Jun 2024:\n")
+print(table(treatment_df$broadband_25mbps_tier_2024, useNA = "ifany"))
+cat("\n")
+
+cat("Change in broadband tier (2014 → 2024):\n")
+print(table(treatment_df$broadband_change, useNA = "ifany"))
+cat("\n")
+
+cat("High broadband in 2014 (tier 4-5):", 
+    sum(treatment_df$high_broadband_2014 == 1, na.rm = TRUE), "counties\n")
+cat("Low broadband in 2014 (tier 0-3):", 
+    sum(treatment_df$high_broadband_2014 == 0, na.rm = TRUE), "counties\n\n")
+
+# PART 3: VISUALIZATIONS
+
+# Distribution of tier codes 2014
+p1 <- ggplot(treatment_df, aes(x = factor(broadband_25mbps_tier_2014))) +
+  geom_bar(fill = "steelblue", alpha = 0.7) +
+  labs(
+    title = "Distribution of Broadband Access in Dec 2014",
+    subtitle = "25+ Mbps connections per 1,000 housing units",
+    x = "Tier Code (0=none, 1=0-200, 2=200-400, 3=400-600, 4=600-800, 5=800+)",
+    y = "Number of Counties"
+  ) +
+  theme_minimal()
+print(p1)
+
+p2 <- ggplot(treatment_df, aes(x = factor(broadband_change))) +
+  geom_bar(fill = "darkgreen", alpha = 0.7) +
+  geom_vline(xintercept = 5.5, color = "red", linetype = "dashed") + 
+  labs(
+    title = "Change in Broadband Access (Dec 2014 → Jun 2024)",
+    subtitle = "Positive = Improvement, Negative = Decline",
+    x = "Change in Tier Code",
+    y = "Number of Counties"
+  ) +
+  theme_minimal()
+print(p2)
+
+transition <- treatment_df %>%
+  count(broadband_25mbps_tier_2014, broadband_25mbps_tier_2024) %>%
+  filter(!is.na(broadband_25mbps_tier_2014), !is.na(broadband_25mbps_tier_2024))
+
+p3 <- ggplot(transition, aes(x = factor(broadband_25mbps_tier_2014), 
+                             y = factor(broadband_25mbps_tier_2024), 
+                             fill = n)) +
+  geom_tile() +
+  geom_text(aes(label = n), color = "white", size = 3) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  labs(
+    title = "Broadband Access Transition Matrix (2014 → 2024)",
+    subtitle = "25+ Mbps connections per 1,000 housing units",
+    x = "Dec 2014 Tier Code",
+    y = "Jun 2024 Tier Code",
+    fill = "Counties"
+  ) +
+  theme_minimal()
+print(p3)
+
+write.csv(treatment_df, "treatment_broadband.csv", row.names = FALSE)
+save(treatment_df, file = "treatment_broadband.RData")
+
+cat("Preview of treatment dataset:\n")
+print(head(treatment_df, 10))
+```
+
+Merging of data
+
+```{r}
+library(tidyverse)
+library(tidycensus)
+library(readxl)
+
+load("treatment_broadband.RData")
+cat("Loaded treatment data:", nrow(treatment_df), "counties\n\n")
+
+chr_2024_raw <- read_excel(
+  "2024_county_health_release_data_-_v1.xlsx",
+  sheet = "Additional Measure Data"
+)
+
+colnames(chr_2024_raw) <- as.character(chr_2024_raw[1, ])
+
+chr_2024 <- chr_2024_raw[-1, ] %>%
+  select(
+    fips = FIPS,
+    state = State,
+    county = County,
+    life_expectancy_2024 = `Life Expectancy`,
+    premature_mortality_2024 = `Age-Adjusted Death Rate`
+  ) %>%
+  mutate(
+    fips = sprintf("%05d", as.numeric(fips)),
+    life_expectancy_2024 = as.numeric(life_expectancy_2024),
+    premature_mortality_2024 = as.numeric(premature_mortality_2024)
+  ) %>%
+  filter(!is.na(fips), nchar(fips) == 5)
+
+cat("  Life expectancy:", sum(!is.na(chr_2024$life_expectancy_2024)), "\n")
+cat("  Premature mortality:", sum(!is.na(chr_2024$premature_mortality_2024)), "\n\n")
+
+chr_2015_raw <- read_excel(
+  "2015 County Health Rankings Data - v3.xls",
+  sheet = "Ranked Measure Data"
+)
+
+colnames(chr_2015_raw) <- as.character(chr_2015_raw[1, ])
+
+chr_2015 <- chr_2015_raw[-1, ] %>%
+  select(
+    fips = FIPS,
+    ypll_2015 = `Years of Potential Life Lost Rate`,
+    poor_health_2015 = `% Fair/Poor`
+  ) %>%
+  mutate(
+    fips = sprintf("%05d", as.numeric(fips)),
+    ypll_2015 = as.numeric(ypll_2015),
+    poor_health_2015 = as.numeric(poor_health_2015)
+  ) %>%
+  filter(!is.na(fips), nchar(fips) == 5)
+
+cat("  YPLL (baseline):", sum(!is.na(chr_2015$ypll_2015)), "\n")
+cat("  Poor health % (baseline):", sum(!is.na(chr_2015$poor_health_2015)), "\n\n")
+
+# https://www.ers.usda.gov/data-products/rural-urban-continuum-codes/
+
+rucc_file_path <- "Ruralurbancontinuumcodes2023.xlsx"
+
+if (file.exists(rucc_file_path)) {
+  rucc_raw <- read_excel(rucc_file_path)
+  
+  rucc_data <- rucc_raw %>%
+    select(
+      fips = 1, 
+      rucc_code = 5 
+    ) %>%
+    mutate(
+      fips = sprintf("%05d", as.numeric(fips)),
+      rucc_code = as.numeric(rucc_code),
+      is_rural = ifelse(rucc_code >= 4, 1, 0),
+      is_metro = ifelse(rucc_code <= 3, 1, 0)
+    )
+  
+  cat("✓ Loaded RUCC:", nrow(rucc_data), "counties\n\n")
+  
+} else {
+  cat("RUCC file not found at:", rucc_file_path, "\n")
+}
+
+library(tidycensus)
+census_api_key("b149a95e30484f77bbcf332b2c927a81257d90a9", install = TRUE,overwrite = TRUE)
+census_vars <- c(
+  total_pop = "B01003_001",
+  median_age = "B01002_001",
+  white = "B02001_002",
+  black = "B02001_003",
+  hispanic = "B03001_003",
+  median_income = "B19013_001",
+  poverty = "B17001_002",
+  total_25plus = "B15003_001",
+  bachelors = "B15003_022",
+  labor_force = "B23025_002",
+  unemployed = "B23025_005"
+)
+
+census_2014 <- get_acs(
+  geography = "county",
+  variables = census_vars,
+  year = 2014,
+  survey = "acs5",
+  geometry = FALSE
+)
+
+census_wide <- census_2014 %>%
+  select(GEOID, variable, estimate) %>%
+  pivot_wider(names_from = variable, values_from = estimate) %>%
+  mutate(
+    fips = GEOID,
+    population = total_pop,
+    median_age = median_age,
+    pct_white = (white / total_pop) * 100,
+    pct_black = (black / total_pop) * 100,
+    pct_hispanic = (hispanic / total_pop) * 100,
+    median_income = median_income,
+    poverty_rate = (poverty / total_pop) * 100,
+    pct_bachelors = (bachelors / total_25plus) * 100,
+    unemployment_rate = (unemployed / labor_force) * 100
+  ) %>%
+  select(fips, population, median_age, pct_white, pct_black, pct_hispanic,
+         median_income, poverty_rate, pct_bachelors, unemployment_rate)
+
+cat("Downloaded Census data:", nrow(census_wide), "counties\n\n")
+
+analysis_df <- treatment_df %>%
+  left_join(chr_2024, by = "fips") %>%
+  left_join(chr_2015, by = "fips") %>%  # Add 2015 baseline health
+  left_join(rucc_data, by = "fips") %>%
+  left_join(census_wide, by = "fips")
+
+cat("Total counties after merge:", nrow(analysis_df), "\n\n")
+
+cat("Merge quality:\n")
+cat("  Treatment (2014):", sum(!is.na(analysis_df$broadband_treatment_2014)), "counties\n")
+cat("  Outcome - Life expectancy (2024):", sum(!is.na(analysis_df$life_expectancy_2024)), "counties\n")
+cat("  Outcome - Premature mortality (2024):", sum(!is.na(analysis_df$premature_mortality_2024)), "counties\n")
+cat("  Baseline - YPLL (2015):", sum(!is.na(analysis_df$ypll_2015)), "counties\n")
+cat("  Baseline - Poor health (2015):", sum(!is.na(analysis_df$poor_health_2015)), "counties\n")
+cat("  RUCC codes:", sum(!is.na(analysis_df$rucc_code)), "counties\n")
+cat("  Census data:", sum(!is.na(analysis_df$population)), "counties\n\n")
+
+complete_for_analysis <- analysis_df %>%
+  filter(
+    !is.na(broadband_treatment_2014),
+    !is.na(life_expectancy_2024),
+    !is.na(ypll_2015), 
+    !is.na(population),
+    !is.na(median_income)
+  )
+
+causal_forest_data <- complete_for_analysis %>%
+  select(
+    fips,
+    state = state.x, 
+    county_name,
+    
+    treatment = broadband_treatment_2014,
+    
+    # OUTCOMES (Y) - 2024 health 
+    outcome_life_exp = life_expectancy_2024,
+    outcome_mortality = premature_mortality_2024,
+    
+    # BASELINE HEALTH COVARIATES (X) - 2015
+    baseline_ypll = ypll_2015,
+    baseline_poor_health = poor_health_2015,
+    
+    # GEOGRAPHIC COVARIATES (X)
+    rucc_code,
+    is_rural,
+    is_metro,
+    
+    # DEMOGRAPHIC COVARIATES (X) - 2014
+    population,
+    median_age,
+    pct_white,
+    pct_black,
+    pct_hispanic,
+    
+    # ECONOMIC COVARIATES (X) - 2014
+    median_income,
+    poverty_rate,
+    unemployment_rate,
+    
+    # EDUCATION COVARIATES (X) - 2014
+    pct_bachelors,
+    
+    # OTHER
+    housing_units_2014
+  )
+
+cat("Causal forest dataset:\n")
+cat("  Counties:", nrow(causal_forest_data), "\n")
+cat("  Treatment (W):", sum(!is.na(causal_forest_data$treatment)), "\n")
+cat("  Outcome - Life expectancy (Y):", sum(!is.na(causal_forest_data$outcome_life_exp)), "\n")
+cat("  Outcome - Mortality (Y):", sum(!is.na(causal_forest_data$outcome_mortality)), "\n")
+cat("  Baseline YPLL (X):", sum(!is.na(causal_forest_data$baseline_ypll)), "\n")
+cat("  Baseline poor health (X):", sum(!is.na(causal_forest_data$baseline_poor_health)), "\n")
+cat("  Total covariates (X):", ncol(causal_forest_data) - 6, "variables\n\n")
+
+# Summary statistics
+cat("Summary statistics:\n\n")
+
+cat("TREATMENT (2014 Broadband):\n")
+print(summary(causal_forest_data$treatment))
+cat("\n")
+
+cat("OUTCOME (2024 Life Expectancy):\n")
+print(summary(causal_forest_data$outcome_life_exp))
+cat("\n")
+
+cat("BASELINE HEALTH (2015 YPLL):\n")
+print(summary(causal_forest_data$baseline_ypll))
+cat("\n")
+
+cat("Key covariates:\n")
+print(summary(causal_forest_data[, c("population", "median_income", "poverty_rate", "is_rural")]))
+cat("\n")
+
+write.csv(analysis_df, "analysis_dataset_full.csv", row.names = FALSE)
+save(analysis_df, file = "analysis_dataset_full.RData")
+
+write.csv(causal_forest_data, "causal_forest_data.csv", row.names = FALSE)
+save(causal_forest_data, file = "causal_forest_data.RData")
+
+print(head(causal_forest_data[, 1:8], 10))
+```
+
+#Causal Forest
+
+```{r}
+library(tidyverse)
+library(grf)
+library(ggplot2)
+library(gridExtra)
+
+set.seed(42)
+
+cf_data <- read.csv("causal_forest_data.csv")
+
+cat("Dataset loaded:", nrow(cf_data), "counties\n")
+cat("Variables:", ncol(cf_data), "\n\n")
+
+cat("Missing values check:\n")
+missing_summary <- sapply(cf_data, function(x) sum(is.na(x)))
+print(missing_summary[missing_summary > 0])
+cat("\n")
+
+cf_complete <- cf_data %>%
+  filter(
+    !is.na(treatment),
+    !is.na(outcome_life_exp),
+    !is.na(baseline_ypll),
+    !is.na(population)
+  )
+
+cat("Complete cases:", nrow(cf_complete), "counties\n\n")
+
+W <- cf_complete$treatment
+
+Y <- cf_complete$outcome_life_exp
+
+X_vars_candidates <- c(
+  "baseline_ypll",
+  "baseline_poor_health",
+  
+  # Geographic 
+  "is_rural",
+  # "rucc_code", 
+  
+  # Demographics
+  "population",
+  "median_age",
+  "pct_white",
+  "pct_black",
+  "pct_hispanic",
+  
+  # Economic
+  "median_income",
+  "poverty_rate",
+  "unemployment_rate",
+  
+  # Education
+  "pct_bachelors"
+)
+
+X_vars <- X_vars_candidates[X_vars_candidates %in% names(cf_complete)]
+
+cat("Using", length(X_vars), "covariates:\n")
+print(X_vars)
+cat("\n")
+
+X <- cf_complete %>%
+  select(all_of(X_vars)) %>%
+  mutate(across(everything(), ~replace_na(., median(., na.rm = TRUE)))) %>%
+  as.matrix()
+
+cat("  Treatment (W):", length(W), "observations\n")
+cat("  Outcome (Y):", length(Y), "observations\n")
+cat("  Covariates (X):", nrow(X), "rows ×", ncol(X), "columns\n\n")
+
+cat("Treatment distribution:\n")
+print(table(W))
+cat("\n")
+
+cat("Outcome summary (Life Expectancy):\n")
+print(summary(Y))
+cat("\n")
+
+start_time <- Sys.time()
+
+cf <- causal_forest(
+  X = X,
+  Y = Y,
+  W = W,
+  num.trees = 4000,       
+  honesty = TRUE,         
+  honesty.fraction = 0.5,  
+  tune.parameters = "all",
+  seed = 42
+)
+
+end_time <- Sys.time()
+cat("Causal forest estimated in", round(difftime(end_time, start_time, units = "secs"), 1), "seconds\n\n")
+
+tau_hat <- predict(cf)$predictions
+
+cf_complete$tau_hat <- tau_hat
+
+cat("Treatment effect estimates:\n")
+print(summary(tau_hat))
+cat("\n")
+
+# Average treatment effect (ATE)
+ate <- average_treatment_effect(cf)
+cat("Average Treatment Effect (ATE):\n")
+cat("  Estimate:", round(ate[1], 4), "\n")
+cat("  Std. Error:", round(ate[2], 4), "\n")
+cat("  95% CI: [", round(ate[1] - 1.96*ate[2], 4), ",", round(ate[1] + 1.96*ate[2], 4), "]\n\n")
+
+cat("  A 1-unit increase in broadband tier (e.g., tier 2 → 3) is associated with\n")
+cat("  an average change of", round(ate[1], 3), "years in life expectancy.\n\n")
+
+#VARIABLE IMPORTANCE
+
+var_imp <- variable_importance(cf)
+
+var_imp_df <- data.frame(
+  variable = X_vars,
+  importance = var_imp
+) %>%
+  arrange(desc(importance))
+
+cat("Top 10 most important covariates for heterogeneity:\n")
+print(var_imp_df %>% head(10))
+cat("\n")
+
+p_varimp <- ggplot(var_imp_df %>% head(10), 
+                   aes(x = reorder(variable, importance), y = importance)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Variable Importance for Treatment Effect Heterogeneity",
+    subtitle = "Which covariates predict variation in broadband effects?",
+    x = "Variable",
+    y = "Importance"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+print(p_varimp)
+
+p_dist <- ggplot(cf_complete, aes(x = tau_hat)) +
+  geom_histogram(bins = 50, fill = "steelblue", alpha = 0.7) +
+  geom_vline(xintercept = ate[1], color = "red", linetype = "dashed", size = 1) +
+  labs(
+    title = "Distribution of Estimated Treatment Effects",
+    subtitle = paste0("ATE = ", round(ate[1], 3), " (red line)"),
+    x = "Treatment Effect (Change in Life Expectancy per Broadband Tier)",
+    y = "Number of Counties"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+print(p_dist)
+
+# Heterogeneity by rural/urban
+
+if ("is_rural" %in% names(cf_complete) && !all(is.na(cf_complete$is_rural))) {
+  cat("Treatment effects by Rural/Urban:\n")
+  rural_effects <- cf_complete %>%
+    filter(!is.na(is_rural)) %>%
+    group_by(is_rural) %>%
+    summarize(
+      n = n(),
+      mean_tau = mean(tau_hat),
+      se_tau = sd(tau_hat) / sqrt(n()),
+      ci_lower = mean_tau - 1.96 * se_tau,
+      ci_upper = mean_tau + 1.96 * se_tau
+    )
+  print(rural_effects)
+  cat("\n")
+  
+  p_rural <- ggplot(cf_complete %>% filter(!is.na(is_rural)), 
+                    aes(x = factor(is_rural), y = tau_hat, fill = factor(is_rural))) +
+    geom_boxplot(alpha = 0.7) +
+    geom_hline(yintercept = ate[1], color = "red", linetype = "dashed") +
+    scale_fill_manual(values = c("0" = "steelblue", "1" = "darkgreen"),
+                      labels = c("0" = "Urban/Metro", "1" = "Rural")) +
+    labs(
+      title = "Treatment Effects: Rural vs Urban Counties",
+      x = "County Type",
+      y = "Treatment Effect (Years of Life Expectancy)",
+      fill = "County Type"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold"))
+  print(p_rural)
+} else {
+  cat(" is_rural variable not available - skipping rural/urban analysis\n\n")
+}
+
+# Heterogeneity by baseline health
+cf_complete <- cf_complete %>%
+  mutate(baseline_health_tercile = ntile(baseline_ypll, 3))
+
+cat("Treatment effects by Baseline Health (YPLL terciles):\n")
+health_effects <- cf_complete %>%
+  group_by(baseline_health_tercile) %>%
+  summarize(
+    n = n(),
+    mean_baseline_ypll = mean(baseline_ypll),
+    mean_tau = mean(tau_hat),
+    se_tau = sd(tau_hat) / sqrt(n())
+  )
+print(health_effects)
+cat("\n")
+
+p_health <- ggplot(cf_complete, aes(x = factor(baseline_health_tercile), y = tau_hat)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  geom_hline(yintercept = ate[1], color = "red", linetype = "dashed") +
+  labs(
+    title = "Treatment Effects by Baseline Health Status",
+    subtitle = "Tercile 1 = Healthiest, Tercile 3 = Least Healthy",
+    x = "Baseline Health Tercile (YPLL)",
+    y = "Treatment Effect (Years of Life Expectancy)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+print(p_health)
+
+# Heterogeneity by income
+cf_complete <- cf_complete %>%
+  mutate(income_tercile = ntile(median_income, 3))
+
+cat("Treatment effects by Income (terciles):\n")
+income_effects <- cf_complete %>%
+  group_by(income_tercile) %>%
+  summarize(
+    n = n(),
+    mean_income = mean(median_income),
+    mean_tau = mean(tau_hat),
+    se_tau = sd(tau_hat) / sqrt(n())
+  )
+print(income_effects)
+cat("\n")
+
+p_income <- ggplot(cf_complete, aes(x = factor(income_tercile), y = tau_hat)) +
+  geom_boxplot(fill = "darkgreen", alpha = 0.7) +
+  geom_hline(yintercept = ate[1], color = "red", linetype = "dashed") +
+  labs(
+    title = "Treatment Effects by Median Income",
+    subtitle = "Tercile 1 = Lowest Income, Tercile 3 = Highest Income",
+    x = "Income Tercile",
+    y = "Treatment Effect (Years of Life Expectancy)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+print(p_income)
+
+# BEST LINEAR PROJECTION 
+
+het_vars_candidates <- c("is_rural", "baseline_ypll", "poverty_rate", "pct_bachelors")
+het_vars <- het_vars_candidates[het_vars_candidates %in% names(cf_complete)]
+
+if (length(het_vars) > 0) {
+  A <- cf_complete %>%
+    select(all_of(het_vars)) %>%
+    mutate(across(everything(), ~replace_na(., median(., na.rm = TRUE)))) %>%
+    as.matrix()
+
+  blp <- best_linear_projection(cf, A = A)
+    blp_coef <- as.numeric(blp[1, ])
+  blp_se   <- as.numeric(blp[2, ])
+  
+  variable_names <- c("(Intercept)", het_vars)
+
+  L <- min(length(variable_names), length(blp_coef))
+  variable_names <- variable_names[1:L]
+  blp_coef <- blp_coef[1:L]
+  blp_se <- blp_se[1:L]
+  
+    blp_results <- tibble(
+    variable = variable_names,
+    coefficient = blp_coef,
+    std_error = blp_se,
+    t_stat = coefficient / std_error,
+    p_value = 2 * (1 - pnorm(abs(t_stat))),
+    sig = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01 ~ "**",
+      p_value < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+  print(blp_results)
+} else {
+  cat(" No heterogeneity variables available for BLP analysis.\n\n")
+}
+
+top_effects <- cf_complete %>%
+  select(fips, state, county_name, tau_hat, treatment, outcome_life_exp, 
+         baseline_ypll, is_rural, median_income, population) %>%
+  arrange(desc(tau_hat)) %>%
+  head(20)
+
+cat("Top 20 counties where broadband has LARGEST positive effect:\n")
+print(top_effects)
+cat("\n")
+
+bottom_effects <- cf_complete %>%
+  select(fips, state, county_name, tau_hat, treatment, outcome_life_exp,
+         baseline_ypll, is_rural, median_income, population) %>%
+  arrange(tau_hat) %>%
+  head(20)
+
+cat("Top 20 counties where broadband has SMALLEST (or negative) effect:\n")
+print(bottom_effects)
+cat("\n")
+
+# CALIBRATION TEST
+
+cal_test <- test_calibration(cf)
+
+cat("Calibration test:\n")
+cat("  Mean forest prediction:", round(cal_test[1, 1], 4), "\n")
+cat("  Mean actual effect:", round(cal_test[2, 1], 4), "\n")
+cat("  Difference:", round(cal_test[1, 1] - cal_test[2, 1], 4), "\n")
+
+results_df <- cf_complete %>%
+  select(fips, state, county_name, treatment, outcome_life_exp, 
+         tau_hat, everything())
+
+head(results_df)
+
+write.csv(results_df, "causal_forest_results.csv", row.names = FALSE)
+
+summary_stats <- list(
+  ate = ate,
+  variable_importance = var_imp_df,
+  baseline_health_effects = health_effects,
+  income_effects = income_effects,
+  top_effects = top_effects,
+  bottom_effects = bottom_effects
+)
+
+if (exists("rural_effects")) {
+  summary_stats$rural_urban_effects <- rural_effects
+}
+if (!is.null(blp_results)) {
+  summary_stats$blp_results <- blp_results
+}
+
+save(summary_stats, cf, file = "causal_forest_analysis.RData")
+
+cat("1. AVERAGE TREATMENT EFFECT:\n")
+cat("   Broadband access increases life expectancy by", round(ate[1], 3), "years per tier\n")
+cat("   95% CI: [", round(ate[1] - 1.96*ate[2], 3), ",", round(ate[1] + 1.96*ate[2], 3), "]\n\n")
+
+cat("2. HETEROGENEITY:\n")
+cat("   Treatment effects range from", round(min(tau_hat), 3), "to", round(max(tau_hat), 3), "years\n")
+cat("   This indicates SUBSTANTIAL heterogeneity across counties\n\n")
+
+summary_stats <- data.frame(
+    Variable = c("Life Expectancy 2024", 
+                 "Broadband Tier 2014",
+                 "Baseline YPLL 2015", 
+                 "Baseline Poor Health 2015 (%)",
+                 "Population 2014",
+                 "Median Age 2014",
+                 "Median Income 2014",
+                 "Poverty Rate 2014 (%)",
+                 "Unemployment Rate 2014 (%)",
+                 "% Bachelor's Degree 2014",
+                 "% White 2014",
+                 "% Black 2014",
+                 "% Hispanic 2014",
+                 "Rural (%)"),
+    
+    Mean = c(
+        mean(causal_forest_data$outcome_life_exp, na.rm=TRUE),
+        mean(causal_forest_data$treatment, na.rm=TRUE),
+        mean(causal_forest_data$baseline_ypll, na.rm=TRUE),
+        mean(causal_forest_data$baseline_poor_health, na.rm=TRUE),
+        mean(causal_forest_data$population, na.rm=TRUE),
+        mean(causal_forest_data$median_age, na.rm=TRUE),
+        mean(causal_forest_data$median_income, na.rm=TRUE),
+        mean(causal_forest_data$poverty_rate, na.rm=TRUE),
+        mean(causal_forest_data$unemployment_rate, na.rm=TRUE),
+        mean(causal_forest_data$pct_bachelors, na.rm=TRUE),
+        mean(causal_forest_data$pct_white, na.rm=TRUE),
+        mean(causal_forest_data$pct_black, na.rm=TRUE),
+        mean(causal_forest_data$pct_hispanic, na.rm=TRUE),
+        mean(causal_forest_data$is_rural, na.rm=TRUE) * 100
+    ),
+    
+    SD = c(
+        sd(causal_forest_data$outcome_life_exp, na.rm=TRUE),
+        sd(causal_forest_data$treatment, na.rm=TRUE),
+        sd(causal_forest_data$baseline_ypll, na.rm=TRUE),
+        sd(causal_forest_data$baseline_poor_health, na.rm=TRUE),
+        sd(causal_forest_data$population, na.rm=TRUE),
+        sd(causal_forest_data$median_age, na.rm=TRUE),
+        sd(causal_forest_data$median_income, na.rm=TRUE),
+        sd(causal_forest_data$poverty_rate, na.rm=TRUE),
+        sd(causal_forest_data$unemployment_rate, na.rm=TRUE),
+        sd(causal_forest_data$pct_bachelors, na.rm=TRUE),
+        sd(causal_forest_data$pct_white, na.rm=TRUE),
+        sd(causal_forest_data$pct_black, na.rm=TRUE),
+        sd(causal_forest_data$pct_hispanic, na.rm=TRUE),
+        sd(causal_forest_data$is_rural, na.rm=TRUE) * 100
+    ),
+    
+    Min = c(
+        min(causal_forest_data$outcome_life_exp, na.rm=TRUE),
+        min(causal_forest_data$treatment, na.rm=TRUE),
+        min(causal_forest_data$baseline_ypll, na.rm=TRUE),
+        min(causal_forest_data$baseline_poor_health, na.rm=TRUE),
+        min(causal_forest_data$population, na.rm=TRUE),
+        min(causal_forest_data$median_age, na.rm=TRUE),
+        min(causal_forest_data$median_income, na.rm=TRUE),
+        min(causal_forest_data$poverty_rate, na.rm=TRUE),
+        min(causal_forest_data$unemployment_rate, na.rm=TRUE),
+        min(causal_forest_data$pct_bachelors, na.rm=TRUE),
+        min(causal_forest_data$pct_white, na.rm=TRUE),
+        min(causal_forest_data$pct_black, na.rm=TRUE),
+        min(causal_forest_data$pct_hispanic, na.rm=TRUE),
+        min(causal_forest_data$is_rural, na.rm=TRUE) * 100
+    ),
+    
+    Max = c(
+        max(causal_forest_data$outcome_life_exp, na.rm=TRUE),
+        max(causal_forest_data$treatment, na.rm=TRUE),
+        max(causal_forest_data$baseline_ypll, na.rm=TRUE),
+        max(causal_forest_data$baseline_poor_health, na.rm=TRUE),
+        max(causal_forest_data$population, na.rm=TRUE),
+        max(causal_forest_data$median_age, na.rm=TRUE),
+        max(causal_forest_data$median_income, na.rm=TRUE),
+        max(causal_forest_data$poverty_rate, na.rm=TRUE),
+        max(causal_forest_data$unemployment_rate, na.rm=TRUE),
+        max(causal_forest_data$pct_bachelors, na.rm=TRUE),
+        max(causal_forest_data$pct_white, na.rm=TRUE),
+        max(causal_forest_data$pct_black, na.rm=TRUE),
+        max(causal_forest_data$pct_hispanic, na.rm=TRUE),
+        max(causal_forest_data$is_rural, na.rm=TRUE) * 100
+    )
+)
+
+summary_stats$Mean <- round(summary_stats$Mean, 2)
+summary_stats$SD <- round(summary_stats$SD, 2)
+summary_stats$Min <- round(summary_stats$Min, 2)
+summary_stats$Max <- round(summary_stats$Max, 2)
+
+summary_stats$N <- nrow(causal_forest_data)
+
+print(summary_stats)
+
+write.csv(summary_stats, "table1_summary_statistics.csv", row.names = FALSE)
+
+table2 <- var_imp_df
+
+write.csv(var_imp_df, "table2_variable_importance.csv", row.names = FALSE)
+
+print(table2)
+
+```
